@@ -1,7 +1,9 @@
+import https from "node:https";
+
 /**
  * @name         NodeSeek 签到 (Arcadia)
  * @description  Arcadia 平台自动签到领鸡腿
- * @version      1.0.0
+ * @version      1.1.0
  */
 
 const BARK_KEY = process.env.BARK;
@@ -21,7 +23,7 @@ async function barkPush(title, body, url = "") {
     return;
   }
   try {
-    const pushUrl = `https://api.day.app/push`;
+    const pushUrl = "https://api.day.app/push";
     const payload = { title, body, device_key: BARK_KEY, group: "nodeseek" };
     if (url) payload.url = url;
     const res = await fetch(pushUrl, {
@@ -37,6 +39,62 @@ async function barkPush(title, body, url = "") {
     }
   } catch (err) {
     log.error("Bark 推送失败:", err.message);
+  }
+}
+
+// ────────── 可重试的 fetch（含 http 模块 fallback） ──────────
+async function fetchWithFallback(url, options = {}, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      options.signal = controller.signal;
+      const response = await fetch(url, options);
+      clearTimeout(timeout);
+      return response;
+    } catch (fetchErr) {
+      // reset signal for retry
+      delete options.signal;
+      log.warn(`fetch 尝试 ${attempt + 1}/${retries + 1} 失败: ${fetchErr.message}`);
+      if (attempt < retries) {
+        const delay = 1000 * (attempt + 1);
+        log.info(`等待 ${delay}ms 后重试...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      // final fallback: use https module directly
+      log.info("使用 https 模块 fallback...");
+      const parsedUrl = new URL(url);
+      const postData = options.body || "";
+      return new Promise((resolve, reject) => {
+        const req = https.request(
+          {
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: options.method || "GET",
+            headers: {
+              ...options.headers,
+              "Content-Length": Buffer.byteLength(postData),
+            },
+            timeout: 15000,
+          },
+          (res) => {
+            let data = "";
+            res.on("data", (chunk) => (data += chunk));
+            res.on("end", () =>
+              resolve({
+                status: res.statusCode,
+                ok: res.statusCode >= 200 && res.statusCode < 300,
+                text: async () => data,
+              })
+            );
+          }
+        );
+        req.on("error", reject);
+        if (postData) req.write(postData);
+        req.end();
+      });
+    }
   }
 }
 
@@ -63,40 +121,33 @@ function loadConfig() {
 }
 
 // ────────── 签到主逻辑 ──────────
-async function checkin(headers) {
+async function checkin(config) {
   const url = "https://www.nodeseek.com/api/attendance?random=true";
 
-  const reqHeaders = {
-    "Connection": headers.Connection || "keep-alive",
-    "Accept-Encoding": headers["Accept-Encoding"] || "gzip, deflate, br",
-    "Content-Type": headers["Content-Type"] || "application/json;charset=UTF-8",
-    "Origin": headers.Origin || "https://www.nodeseek.com",
-    "refract-sign": headers["refract-sign"] || "",
-    "User-Agent": headers["User-Agent"] || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "refract-key": headers["refract-key"] || "",
-    "Sec-Fetch-Mode": headers["Sec-Fetch-Mode"] || "cors",
-    "Cookie": headers.Cookie || "",
-    "Host": headers.Host || "www.nodeseek.com",
-    "Referer": headers.Referer || "https://www.nodeseek.com/",
-    "Accept": headers["Accept"] || "application/json, text/plain, */*",
-    "Accept-Language": headers["Accept-Language"] || "zh-CN,zh;q=0.9",
+  const requestHeaders = {
+    "Connection": config.Connection || "keep-alive",
+    "Accept-Encoding": config["Accept-Encoding"] || "gzip, deflate, br",
+    "Content-Type": config["Content-Type"] || "application/json;charset=UTF-8",
+    "Origin": config.Origin || "https://www.nodeseek.com",
+    "refract-sign": config["refract-sign"] || "",
+    "User-Agent": config["User-Agent"] || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "refract-key": config["refract-key"] || "",
+    "Sec-Fetch-Mode": config["Sec-Fetch-Mode"] || "cors",
+    "Cookie": config.Cookie || "",
+    "Host": config.Host || "www.nodeseek.com",
+    "Referer": config.Referer || "https://www.nodeseek.com/",
+    "Accept": config["Accept"] || "application/json, text/plain, */*",
+    "Accept-Language": config["Accept-Language"] || "zh-CN,zh;q=0.9",
   };
 
   log.info("开始签到...");
-
   const startTime = Date.now();
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithFallback(url, {
       method: "POST",
-      headers: reqHeaders,
-      signal: controller.signal,
+      headers: requestHeaders,
     });
-
-    clearTimeout(timeout);
 
     const status = response.status;
     const bodyText = await response.text();
@@ -110,7 +161,6 @@ async function checkin(headers) {
 
     log.info(`状态码: ${status} | 耗时: ${elapsed}s | 响应: ${message}`);
 
-    // 处理结果
     if (status >= 200 && status < 300) {
       await barkPush(`${SCRIPT_NAME} ✅ 签到成功`, message, "https://www.nodeseek.com");
       return { success: true, message };
@@ -131,9 +181,7 @@ async function checkin(headers) {
     log.warn(`${status} 异常:`, message);
     await barkPush(`${SCRIPT_NAME} ⚠️ ${status} 异常`, message);
     return { success: false, message: `${status}: ${message}` };
-
   } catch (err) {
-    clearTimeout(timeout);
     log.error("请求错误:", err.message);
     await barkPush(`${SCRIPT_NAME} ❌ 请求错误`, err.message);
     return { success: false, message: err.message };
