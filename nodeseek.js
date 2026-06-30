@@ -1,9 +1,10 @@
 import https from "node:https";
+import dns from "node:dns";
 
 /**
  * @name         NodeSeek 签到 (Arcadia)
  * @description  Arcadia 平台自动签到领鸡腿
- * @version      1.1.0
+ * @version      1.2.0
  */
 
 const BARK_KEY = process.env.BARK;
@@ -42,8 +43,21 @@ async function barkPush(title, body, url = "") {
   }
 }
 
+// ────────── 诊断工具 ──────────
+async function diagnoseConnection(hostname) {
+  log.info(`[诊断] 解析 DNS: ${hostname}`);
+  try {
+    const addresses = await dns.promises.resolve4(hostname);
+    log.info(`[诊断] DNS 解析结果: ${addresses.join(", ")}`);
+  } catch (err) {
+    log.error(`[诊断] DNS 解析失败: ${err.code} ${err.message}`);
+  }
+}
+
 // ────────── 可重试的 fetch（含 http 模块 fallback） ──────────
 async function fetchWithFallback(url, options = {}, retries = 2) {
+  await diagnoseConnection(new URL(url).hostname);
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const controller = new AbortController();
@@ -53,9 +67,8 @@ async function fetchWithFallback(url, options = {}, retries = 2) {
       clearTimeout(timeout);
       return response;
     } catch (fetchErr) {
-      // reset signal for retry
       delete options.signal;
-      log.warn(`fetch 尝试 ${attempt + 1}/${retries + 1} 失败: ${fetchErr.message}`);
+      log.warn(`fetch 尝试 ${attempt + 1}/${retries + 1} 失败: ${fetchErr.cause || fetchErr.message} (${fetchErr.code || fetchErr.constructor.name})`);
       if (attempt < retries) {
         const delay = 1000 * (attempt + 1);
         log.info(`等待 ${delay}ms 后重试...`);
@@ -90,7 +103,15 @@ async function fetchWithFallback(url, options = {}, retries = 2) {
             );
           }
         );
-        req.on("error", reject);
+        req.on("error", (err) => {
+          log.error(`https fallback 错误: ${err.code || err.message} (${err.constructor.name})`);
+          log.error(`https fallback 完整错误对象: ${JSON.stringify(err, Object.getOwnPropertyNames(err))}`);
+          reject(err);
+        });
+        req.on("timeout", () => {
+          req.destroy();
+          reject(new Error("https fallback 超时"));
+        });
         if (postData) req.write(postData);
         req.end();
       });
