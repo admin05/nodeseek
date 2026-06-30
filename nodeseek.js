@@ -1,10 +1,9 @@
-import https from "node:https";
 import dns from "node:dns";
 
 /**
  * @name         NodeSeek 签到 (Arcadia)
  * @description  Arcadia 平台自动签到领鸡腿
- * @version      1.2.0
+ * @version      1.3.0
  */
 
 const BARK_KEY = process.env.BARK;
@@ -44,79 +43,69 @@ async function barkPush(title, body, url = "") {
 }
 
 // ────────── 诊断工具 ──────────
-async function diagnoseConnection(hostname) {
-  log.info(`[诊断] 解析 DNS: ${hostname}`);
+async function diagnose() {
+  const proxyVars = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+  for (const v of proxyVars) {
+    if (process.env[v]) log.info(`[诊断] ${v}=${process.env[v]}`);
+  }
+  log.info("[诊断] DNS 系统解析 www.nodeseek.com...");
   try {
-    const addresses = await dns.promises.resolve4(hostname);
+    const addresses = await dns.promises.resolve4("www.nodeseek.com");
     log.info(`[诊断] DNS 解析结果: ${addresses.join(", ")}`);
+    return { hostname: "www.nodeseek.com", resolvedIp: addresses[0] };
   } catch (err) {
-    log.error(`[诊断] DNS 解析失败: ${err.code} ${err.message}`);
+    log.error(`[诊断] DNS 解析失败: ${err.message}`);
+    return { hostname: "www.nodeseek.com", resolvedIp: null };
   }
 }
 
-// ────────── 可重试的 fetch（含 http 模块 fallback） ──────────
-async function fetchWithFallback(url, options = {}, retries = 2) {
-  await diagnoseConnection(new URL(url).hostname);
+// ────────── 直连请求（绕过代理，用解析到的真实 IP） ──────────
+function directRequest(url, options, resolvedIp) {
+  const parsedUrl = new URL(url);
+  const postData = options.body || "";
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-      options.signal = controller.signal;
-      const response = await fetch(url, options);
-      clearTimeout(timeout);
-      return response;
-    } catch (fetchErr) {
-      delete options.signal;
-      log.warn(`fetch 尝试 ${attempt + 1}/${retries + 1} 失败: ${fetchErr.cause || fetchErr.message} (${fetchErr.code || fetchErr.constructor.name})`);
-      if (attempt < retries) {
-        const delay = 1000 * (attempt + 1);
-        log.info(`等待 ${delay}ms 后重试...`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      // final fallback: use https module directly
-      log.info("使用 https 模块 fallback...");
-      const parsedUrl = new URL(url);
-      const postData = options.body || "";
-      return new Promise((resolve, reject) => {
-        const req = https.request(
-          {
-            hostname: parsedUrl.hostname,
-            path: parsedUrl.pathname + parsedUrl.search,
-            method: options.method || "GET",
-            headers: {
-              ...options.headers,
-              "Content-Length": Buffer.byteLength(postData),
-            },
-            timeout: 15000,
-          },
-          (res) => {
-            let data = "";
-            res.on("data", (chunk) => (data += chunk));
-            res.on("end", () =>
-              resolve({
-                status: res.statusCode,
-                ok: res.statusCode >= 200 && res.statusCode < 300,
-                text: async () => data,
-              })
-            );
-          }
+  return new Promise((resolve, reject) => {
+    // headers 里已经有了 Content-Type 等
+    const reqHeaders = {
+      ...options.headers,
+      "Content-Length": Buffer.byteLength(postData),
+    };
+
+    // 重点：如果解析到了真实 IP，直接用 IP 连 + Host header 保证 SNI 正确
+    const connectHost = resolvedIp || parsedUrl.hostname;
+    log.info(`直连目标: ${connectHost}:443 (Host: ${parsedUrl.hostname})`);
+
+    const req = https.request(
+      {
+        hostname: connectHost,
+        port: 443,
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: options.method || "GET",
+        headers: reqHeaders,
+        servername: parsedUrl.hostname, // SNI
+        timeout: 15000,
+        rejectUnauthorized: true,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode,
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            text: async () => data,
+          })
         );
-        req.on("error", (err) => {
-          log.error(`https fallback 错误: ${err.code || err.message} (${err.constructor.name})`);
-          log.error(`https fallback 完整错误对象: ${JSON.stringify(err, Object.getOwnPropertyNames(err))}`);
-          reject(err);
-        });
-        req.on("timeout", () => {
-          req.destroy();
-          reject(new Error("https fallback 超时"));
-        });
-        if (postData) req.write(postData);
-        req.end();
-      });
-    }
-  }
+      }
+    );
+    req.on("timeout", () => { req.destroy(); reject(new Error("直连请求超时")); });
+    req.on("error", (err) => {
+      log.error(`直连错误: ${err.code || err.message}`);
+      reject(err);
+    });
+    if (postData) req.write(postData);
+    req.end();
+  });
 }
 
 // ────────── 读取配置 ──────────
@@ -162,13 +151,15 @@ async function checkin(config) {
   };
 
   log.info("开始签到...");
+
+  // 诊断网络环境
+  const diag = await diagnose();
+
   const startTime = Date.now();
 
   try {
-    const response = await fetchWithFallback(url, {
-      method: "POST",
-      headers: requestHeaders,
-    });
+    // 直接使用直连，绕过 fetch（Arcadia 环境下 fetch 会走代理到错误出口）
+    const response = await directRequest(url, { method: "POST", headers: requestHeaders }, diag.resolvedIp);
 
     const status = response.status;
     const bodyText = await response.text();
