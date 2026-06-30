@@ -1,0 +1,10 @@
+{
+  "name": "nodeseek-checkin",
+  "version": "1.0.0",
+  "description": "NodeSeek 自动签到脚本（Arcadia 平台）",
+  "type": "module",
+  "main": "nodeseek.js",
+  "scripts": {
+    "start": "node nodeseek.js"
+  }
+}
