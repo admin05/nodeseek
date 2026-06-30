@@ -1,16 +1,16 @@
 /**
  * @name         NodeSeek 签到 (Arcadia)
  * @description  Arcadia 平台自动签到领鸡腿
- * @version      1.6.0
+ * @version      1.7.0
  */
 
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const https = require("https");
-const http = require("http");
 const dns = require("dns");
 const net = require("net");
 const tls = require("tls");
+const zlib = require("zlib");
 const { readFileSync, existsSync } = require("fs");
 const { resolve, dirname } = require("path");
 const { fileURLToPath } = require("url");
@@ -25,18 +25,15 @@ const log = {
 };
 
 async function barkPush(title, body, url = "") {
-  if (!BARK_KEY) { log.warn("BARK 未设置，跳过推送"); return; }
+  if (!BARK_KEY) { log.warn("BARK 未设置"); return; }
   try {
-    const res = await fetch("https://api.day.app/push", {
+    await fetch("https://api.day.app/push", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify({ title, body, device_key: BARK_KEY, group: "nodeseek", ...(url ? { url } : {}) }),
     });
-    await res.json();
     log.info("Bark 推送成功");
-  } catch (err) {
-    log.error("Bark 推送失败:", err.message);
-  }
+  } catch (err) { log.error("Bark 推送失败:", err.message); }
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -44,10 +41,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 function loadConfig() {
   const p = resolve(__dirname, "config.json");
   if (!existsSync(p)) { log.error("config.json 不存在"); process.exit(1); }
-  try { return JSON.parse(readFileSync(p, "utf-8")); } catch (err) { log.error("config.json 解析失败:", err.message); process.exit(1); }
+  try { return JSON.parse(readFileSync(p, "utf-8")); } catch { log.error("config.json 解析失败"); process.exit(1); }
 }
 
-// ────────── 获取代理 ──────────
 function getProxy() {
   for (const v of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) {
     if (process.env[v]) {
@@ -57,96 +53,85 @@ function getProxy() {
   return null;
 }
 
-// ────────── DNS 多源解析 ──────────
 async function resolveIPs(hostname) {
   const results = [];
   const tried = new Set();
-  const dnsServers = [
+  for (const { name, servers } of [
     { name: "Cloudflare", servers: ["1.1.1.1", "1.0.0.1"] },
     { name: "Google", servers: ["8.8.8.8", "8.8.4.4"] },
-    { name: "OpenDNS", servers: ["208.67.222.222", "208.67.220.220"] },
-  ];
-
-  for (const { name, servers } of dnsServers) {
+  ]) {
     try {
       const orig = dns.getServers();
       dns.setServers(servers);
       const addrs = await dns.promises.resolve4(hostname);
       dns.setServers(orig);
-      log.info(`[DNS] ${name}: ${addrs.join(", ")}`);
       for (const ip of addrs) { if (!tried.has(ip)) { tried.add(ip); results.push(ip); } }
-    } catch { log.warn(`[DNS] ${name} 解析失败`); }
+    } catch {}
   }
-  // 系统 DNS 保底
-  try {
-    const addrs = await dns.promises.resolve4(hostname);
-    log.info(`[DNS] 系统: ${addrs.join(", ")}`);
-    for (const ip of addrs) { if (!tried.has(ip)) { tried.add(ip); results.push(ip); } }
-  } catch {}
-  log.info(`[DNS] 共 ${results.length} 个唯一 IP: ${results.join(", ")}`);
   return results;
 }
 
-// ────────── 通过代理发送 HTTPS 请求（使用 Node.js 原生 https.request 解析响应） ──────────
+// ────────── 通过代理 CONNECT 隧道发请求（响应体自动解压） ──────────
 function proxyRequest(proxy, targetHost, options) {
   const parsedUrl = new URL(options.url);
   const postData = options.body || "";
-  const useIP = targetHost !== parsedUrl.hostname;
 
   return new Promise((resolve, reject) => {
-    const label = useIP ? `代理+${targetHost}` : "代理+hostname";
-    log.info(`[策略] ${label}: CONNECT ${targetHost}:443`);
+    log.info(`[CONNECT] ${targetHost}:443`);
 
-    // 1. 连代理
     const proxySocket = net.connect({ host: proxy.host, port: proxy.port }, () => {
-      // 2. 发 CONNECT
       proxySocket.write(`CONNECT ${targetHost}:443 HTTP/1.1\r\nHost: ${targetHost}:443\r\n\r\n`);
 
-      let headerBuf = "";
-      const onProxyData = (chunk) => {
-        headerBuf += chunk.toString();
-        if (headerBuf.includes("\r\n\r\n")) {
-          proxySocket.removeListener("data", onProxyData);
-          if (!headerBuf.includes("200")) {
-            reject(new Error(`代理 CONNECT 拒绝: ${headerBuf.slice(0, 100)}`));
-            return;
-          }
-          log.info(`[CONNECT] 隧道建立成功`);
+      let buf = "";
+      const onData = (chunk) => {
+        buf += chunk.toString();
+        if (!buf.includes("\r\n\r\n")) return;
+        proxySocket.removeListener("data", onData);
 
-          // 3. 升 TLS
-          const tlsSocket = tls.connect({ socket: proxySocket, servername: parsedUrl.hostname },
-            () => {
-              log.info(`[TLS] 握手成功 (SNI: ${parsedUrl.hostname})`);
+        if (!buf.includes("200")) {
+          reject(new Error(`代理拒绝: ${buf.slice(0, 80)}`));
+          return;
+        }
 
-              // 4. 用标准 Node.js https.request 通过这个 socket 发请求
-              const req = https.request({
-                socket: tlsSocket,
-                host: parsedUrl.hostname,
-                path: parsedUrl.pathname + parsedUrl.search,
-                method: options.method || "GET",
-                headers: options.headers,
-                // 不创建新连接，直接用已有 socket
-                createConnection: () => tlsSocket,
-              }, (res) => {
-                let body = "";
-                res.on("data", (d) => body += d);
-                res.on("end", () => {
-                  resolve({
-                    status: res.statusCode,
-                    ok: res.statusCode >= 200 && res.statusCode < 300,
-                    text: async () => body,
-                  });
+        const tlsSocket = tls.connect({ socket: proxySocket, servername: parsedUrl.hostname },
+          () => {
+            const req = https.request({
+              socket: tlsSocket,
+              host: parsedUrl.hostname,
+              path: parsedUrl.pathname + parsedUrl.search,
+              method: options.method || "GET",
+              headers: options.headers,
+              createConnection: () => tlsSocket,
+            }, (res) => {
+              const chunks = [];
+              res.on("data", (d) => chunks.push(d));
+              res.on("end", () => {
+                const raw = Buffer.concat(chunks);
+                // 自动解压
+                const ce = (res.headers["content-encoding"] || "").toLowerCase();
+                let decompressed = raw;
+                if (ce === "gzip" || ce === "x-gzip") {
+                  decompressed = zlib.gunzipSync(raw);
+                } else if (ce === "deflate") {
+                  decompressed = zlib.inflateSync(raw);
+                } else if (ce === "br") {
+                  try { decompressed = zlib.brotliDecompressSync(raw); } catch {}
+                }
+                resolve({
+                  status: res.statusCode,
+                  ok: res.statusCode >= 200 && res.statusCode < 300,
+                  text: async () => decompressed.toString("utf-8"),
                 });
               });
-              req.on("error", reject);
-              if (postData) req.write(postData);
-              req.end();
-            }
-          );
-          tlsSocket.on("error", (err) => reject(new Error(`TLS 错误: ${err.message}`)));
-        }
+            });
+            req.on("error", reject);
+            if (postData) req.write(postData);
+            req.end();
+          }
+        );
+        tlsSocket.on("error", (err) => reject(new Error(`TLS 错误: ${err.message}`)));
       };
-      proxySocket.on("data", onProxyData);
+      proxySocket.on("data", onData);
     });
 
     proxySocket.on("error", (err) => reject(new Error(`代理连接失败: ${err.message}`)));
@@ -176,18 +161,11 @@ async function checkin(config) {
   const proxy = getProxy();
   if (proxy) log.info(`[代理] ${proxy.host}:${proxy.port}`);
 
-  const ips = await resolveIPs("www.nodeseek.com");
-
   log.info("开始签到...");
   const startTime = Date.now();
 
   const tryRequest = async (targetHost) => {
-    if (proxy) {
-      return await proxyRequest(proxy, targetHost, {
-        url: apiUrl, method: "POST", headers: requestHeaders, body: "",
-      });
-    }
-    // No proxy: direct request
+    if (proxy) return await proxyRequest(proxy, targetHost, { url: apiUrl, method: "POST", headers: requestHeaders, body: "" });
     const parsedUrl = new URL(apiUrl);
     return new Promise((resolve, reject) => {
       const req = https.request({
@@ -209,18 +187,19 @@ async function checkin(config) {
   };
 
   let lastErr;
-  const targets = proxy ? [...ips, "www.nodeseek.com"] : ips;
+  const targets = proxy ? ["www.nodeseek.com"] : await resolveIPs("www.nodeseek.com");
 
   for (const target of targets) {
-    const label = target === "www.nodeseek.com" ? target : `IP ${target}`;
     try {
       const resp = await tryRequest(target);
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
       let msg = await resp.text();
       try { const p = JSON.parse(msg); msg = p.message || msg; } catch {}
-      log.info(`状态码: ${resp.status} | 耗时: ${elapsed}s | ${label}: ${msg.slice(0, 100)}`);
+
+      log.info(`状态码: ${resp.status} | 耗时: ${elapsed}s`);
 
       if (resp.status >= 200 && resp.status < 300) {
+        log.info(`响应: ${msg}`);
         await barkPush(`${SCRIPT_NAME} ✅ 签到成功`, msg);
         return { success: true, message: msg };
       }
@@ -230,14 +209,18 @@ async function checkin(config) {
         return { success: true, message: "今日已签到" };
       }
       if (resp.status === 403) {
-        await barkPush(`${SCRIPT_NAME} ❌ 风控`, `内容：${msg}`);
-        return { success: false, message: `403: ${msg}` };
+        const brief = msg.length > 200 ? msg.slice(0, 200) + "..." : msg;
+        log.warn(`403 被拦截 (Cloudflare WAF/风控): ${brief}`);
+        await barkPush(`${SCRIPT_NAME} ❌ 签到被拦截 (403)`, `可能是 Cloudflare WAF 拦截或 IP 被封，请稍后再试`);
+        return { success: false, message: "403 被拦截" };
       }
-      await barkPush(`${SCRIPT_NAME} ⚠️ ${resp.status}`, msg);
-      return { success: false, message: `${resp.status}: ${msg}` };
+      const brief = msg.length > 200 ? msg.slice(0, 200) + "..." : msg;
+      log.warn(`${resp.status} 异常: ${brief}`);
+      await barkPush(`${SCRIPT_NAME} ⚠️ ${resp.status}`, brief);
+      return { success: false, message: `${resp.status}: ${brief}` };
     } catch (err) {
       lastErr = err;
-      log.warn(`✗ ${label}: ${err.message}`);
+      log.warn(`✗ ${target}: ${err.message}`);
     }
   }
 
@@ -249,10 +232,10 @@ async function checkin(config) {
 async function main() {
   log.info("启动");
   const config = loadConfig();
-  if (!config.Cookie) { log.error("Cookie 为空"); await barkPush(`${SCRIPT_NAME} ❌ 配置错误`, "Cookie 为空"); process.exit(1); }
-  const result = await checkin(config);
+  if (!config.Cookie) { log.error("Cookie 为空"); process.exit(1); }
+  const r = await checkin(config);
   log.info("执行完成");
-  process.exit(result.success ? 0 : 1);
+  process.exit(r.success ? 0 : 1);
 }
 
-main().catch((err) => { log.error("异常:", err.message); barkPush(`${SCRIPT_NAME} ❌ 异常`, err.message); process.exit(1); });
+main().catch((err) => { log.error("异常:", err.message); process.exit(1); });
