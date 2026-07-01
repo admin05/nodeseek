@@ -1,7 +1,7 @@
 /**
  * @name         NodeSeek 签到 (Arcadia)
  * @description  Arcadia 平台自动签到领鸡腿
- * @version      1.7.0
+ * @version      1.8.0
  */
 
 import { createRequire } from "module";
@@ -23,6 +23,26 @@ const log = {
   warn: (...args) => console.warn(`[${SCRIPT_NAME}]`, ...args),
   error: (...args) => console.error(`[${SCRIPT_NAME}]`, ...args),
 };
+
+function getHeader(headers, name) {
+  const key = Object.keys(headers || {}).find((k) => k.toLowerCase() === name.toLowerCase());
+  return key ? headers[key] : "";
+}
+
+function isCloudflareChallenge(resp, body) {
+  const mitigated = String(getHeader(resp.headers, "cf-mitigated")).toLowerCase();
+  const server = String(getHeader(resp.headers, "server")).toLowerCase();
+  return resp.status === 403
+    && (mitigated === "challenge" || (server.includes("cloudflare") && body.includes("Just a moment")));
+}
+
+function cloudflareAdvice() {
+  return [
+    "Cloudflare 已返回 challenge，当前请求未进入 NodeSeek 签到接口。",
+    "请用与 Arcadia 相同的出口 IP/代理在浏览器打开 NodeSeek 并通过验证。",
+    "然后重新复制 Cookie，确认包含 cf_clearance，再更新 config.json 后重试。",
+  ].join("\n");
+}
 
 async function barkPush(title, body, url = "") {
   if (!BARK_KEY) { log.warn("BARK 未设置"); return; }
@@ -119,6 +139,7 @@ function proxyRequest(proxy, targetHost, options) {
                 }
                 resolve({
                   status: res.statusCode,
+                  headers: res.headers,
                   ok: res.statusCode >= 200 && res.statusCode < 300,
                   text: async () => decompressed.toString("utf-8"),
                 });
@@ -177,9 +198,26 @@ async function checkin(config) {
         servername: parsedUrl.hostname,
         timeout: 15000,
       }, (res) => {
-        let body = "";
-        res.on("data", (d) => body += d);
-        res.on("end", () => resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, text: async () => body }));
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks);
+          const ce = (res.headers["content-encoding"] || "").toLowerCase();
+          let body = raw;
+          if (ce === "gzip" || ce === "x-gzip") {
+            body = zlib.gunzipSync(raw);
+          } else if (ce === "deflate") {
+            body = zlib.inflateSync(raw);
+          } else if (ce === "br") {
+            try { body = zlib.brotliDecompressSync(raw); } catch {}
+          }
+          resolve({
+            status: res.statusCode,
+            headers: res.headers,
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            text: async () => body.toString("utf-8"),
+          });
+        });
       });
       req.on("error", reject);
       req.end();
@@ -208,11 +246,19 @@ async function checkin(config) {
         await barkPush(`${SCRIPT_NAME} ℹ️ 今日已签到`, "今天已经领过鸡腿啦，明天再来吧~");
         return { success: true, message: "今日已签到" };
       }
+      if (isCloudflareChallenge(resp, msg)) {
+        const brief = msg.length > 200 ? msg.slice(0, 200) + "..." : msg;
+        const advice = cloudflareAdvice();
+        log.warn(`403 Cloudflare challenge: ${brief}`);
+        log.warn(advice);
+        await barkPush(`${SCRIPT_NAME} ❌ Cloudflare 验证`, advice);
+        return { success: false, message: "Cloudflare challenge" };
+      }
       if (resp.status === 403) {
         const brief = msg.length > 200 ? msg.slice(0, 200) + "..." : msg;
-        log.warn(`403 被拦截 (Cloudflare WAF/风控): ${brief}`);
-        await barkPush(`${SCRIPT_NAME} ❌ 签到被拦截 (403)`, `可能是 Cloudflare WAF 拦截或 IP 被封，请稍后再试`);
-        return { success: false, message: "403 被拦截" };
+        log.warn(`403 被拒绝: ${brief}`);
+        await barkPush(`${SCRIPT_NAME} ❌ 签到被拒绝 (403)`, `NodeSeek 返回 403，请检查 Cookie、refract-sign/refract-key 是否过期`);
+        return { success: false, message: "403 被拒绝" };
       }
       const brief = msg.length > 200 ? msg.slice(0, 200) + "..." : msg;
       log.warn(`${resp.status} 异常: ${brief}`);

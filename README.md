@@ -33,3 +33,16 @@ node nodeseek.js
 | 变量 | 说明 |
 |------|------|
 | BARK | Bark 推送 Key，用于发送签到结果通知 |
+
+## Cloudflare 403 处理
+
+如果日志出现 `cf-mitigated: challenge`、`Just a moment...` 或脚本提示 `Cloudflare 验证`，说明请求被 Cloudflare 拦在站点入口，尚未进入 NodeSeek 签到接口。
+
+处理步骤：
+
+1. 在浏览器中使用与 Arcadia 相同的出口 IP 或代理打开 `https://www.nodeseek.com/`。
+2. 完成 Cloudflare 验证并确认浏览器可正常访问 NodeSeek。
+3. 从浏览器开发者工具重新复制 Cookie 到 `config.json`，确认 Cookie 中包含 `cf_clearance`。
+4. 保持 Arcadia 运行脚本时使用同一个出口 IP 或代理，再重新运行。
+
+如果浏览器和 Arcadia 使用不同出口 IP，`cf_clearance` 通常不会生效，脚本仍可能继续返回 403。
